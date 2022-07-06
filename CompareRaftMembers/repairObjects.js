@@ -147,8 +147,41 @@ function parseDiffKey(diffKey) {
     return { bucket, key };
 }
 
-function repairObject(bucketdUrl, mdBlob, cb) {
-    httpRequest('POST', bucketdUrl, mdBlob, cb);
+function repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, cb) {
+    httpRequest('GET', bucketdUrl, null, (err, res) => {
+        if (err) {
+            log.error('error during HTTP request to check object metadata prior to repair',
+                      { bucket, key, error: err.message });
+            return cb(err);
+        }
+        if (res.statusCode === 200) {
+            if (!leaderMd) {
+                log.warn('not repairing object: object has changed on leader\'s view '
+                         + '(exists but expected to be missing)',
+                         { bucket, key });
+                return cb(errors.PreconditionFailed);
+            }
+            if (leaderMd !== res.body) {
+                log.warn('not repairing object: object has changed on leader\'s view '
+                         + '(metadata changed)',
+                         { bucket, key });
+                return cb(errors.PreconditionFailed);
+            }
+            return httpRequest('POST', bucketdUrl, repairMd, cb);
+        }
+        if (res.statusCode === 404) {
+            if (leaderMd) {
+                log.warn('not repairing object: object has changed on leader\'s view '
+                         + '(missing but expected to exist)',
+                         { bucket, key });
+                return cb(errors.PreconditionFailed);
+            }
+            return httpRequest('POST', bucketdUrl, repairMd, cb);
+        }
+        log.error('error during HTTP request to check object metadata prior to repair',
+                  { bucket, key, statusCode: res.statusCode });
+        return cb(errors.InternalError);
+    });
 }
 
 function checkDiffEntry(diffEntry, cb) {
@@ -158,8 +191,9 @@ function checkDiffEntry(diffEntry, cb) {
             Bucket: bucket,
             Key: key,
         });
-        const md = JSON.parse(diffEntry[1].value);
-        checkSproxydKeys(bucketdUrl, md.location, err => {
+        const leaderMd = JSON.parse(diffEntry[1].value);
+        const repairMd = leaderMd;
+        checkSproxydKeys(bucketdUrl, repairMd.location, err => {
             if (err) {
                 log.warn('object is not repairable: absent from follower\'s view '
                          + 'and not readable from leader\'s view',
@@ -168,7 +202,7 @@ function checkDiffEntry(diffEntry, cb) {
             }
             // if there was no error, the object is not corrupted so
             // we can safely repair its metadata
-            return repairObject(bucket, key, md, err => {
+            return repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, err => {
                 if (err) {
                     log.error('an error occurred trying to repair object using '
                               + 'leader\'s view',
@@ -186,8 +220,8 @@ function checkDiffEntry(diffEntry, cb) {
             Bucket: bucket,
             Key: key,
         });
-        const md = JSON.parse(diffEntry[0].value);
-        checkSproxydKeys(bucketdUrl, md.location, err => {
+        const repairMd = JSON.parse(diffEntry[0].value);
+        checkSproxydKeys(bucketdUrl, repairMd.location, err => {
             if (err) {
                 log.warn('object is not repairable: absent from leader\'s view '
                          + 'and not readable from follower\'s view',
@@ -196,7 +230,8 @@ function checkDiffEntry(diffEntry, cb) {
             }
             // if there was no error, the object is not corrupted so
             // we can safely repair its metadata
-            return repairObject(bucket, key, md, err => {
+            // pass 'null' as the leader MD because it is expected not to exist
+            return repairObjectMD(bucket, key, bucketdUrl, null, repairMd, err => {
                 if (err) {
                     log.error('an error occurred trying to repair object using '
                               + 'follower\'s view',
@@ -224,8 +259,8 @@ function checkDiffEntry(diffEntry, cb) {
                          { bucket, key });
                 cb();
             } else if (diffItemIsValid[0]) {
-                const validMd = diffEntry[0].value;
-                return repairObject(bucketdUrl, validMd, err => {
+                const [leaderMd, repairMd] = [diffEntry[1].value, diffEntry[0].value];
+                return repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, err => {
                     if (err) {
                         log.error('an error occurred trying to repair object using '
                                   + 'follower\'s view',
@@ -237,8 +272,8 @@ function checkDiffEntry(diffEntry, cb) {
                     cb();
                 });
             } else if (diffItemIsValid[1]) {
-                const validMd = diffEntry[1].value;
-                return repairObject(bucketdUrl, validMd, err => {
+                const [leaderMd, repairMd] = [diffEntry[0].value, diffEntry[1].value];
+                return repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, err => {
                     if (err) {
                         log.error('an error occurred trying to repair object from '
                                   + 'leader\'s view',
