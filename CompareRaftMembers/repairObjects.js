@@ -6,6 +6,7 @@ const { Logger } = require('werelogs');
 const { jsutil, errors } = require('arsenal');
 
 const getBucketdURL = require('../VerifyBucketSproxydKeys/getBucketdURL');
+const getRepairStrategy = require('./RepairObjects/getRepairStrategy');
 
 const {
     BUCKETD_HOSTPORT, SPROXYD_HOSTPORT,
@@ -147,161 +148,78 @@ function parseDiffKey(diffKey) {
     return { bucket, key };
 }
 
-function repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, cb) {
-    httpRequest('GET', bucketdUrl, null, (err, res) => {
-        if (err) {
-            log.error('error during HTTP request to check object metadata prior to repair',
-                      { bucket, key, error: err.message });
-            return cb(err);
-        }
-        if (res.statusCode === 200) {
-            if (!leaderMd) {
-                log.warn('not repairing object: object has changed on leader\'s view '
-                         + '(exists but expected to be missing)',
-                         { bucket, key });
-                return cb(errors.PreconditionFailed);
-            }
-            if (leaderMd !== res.body) {
-                log.warn('not repairing object: object has changed on leader\'s view '
-                         + '(metadata changed)',
-                         { bucket, key });
-                return cb(errors.PreconditionFailed);
-            }
-            return httpRequest('POST', bucketdUrl, repairMd, cb);
-        }
-        if (res.statusCode === 404) {
-            if (leaderMd) {
-                log.warn('not repairing object: object has changed on leader\'s view '
-                         + '(missing but expected to exist)',
-                         { bucket, key });
-                return cb(errors.PreconditionFailed);
-            }
-            return httpRequest('POST', bucketdUrl, repairMd, cb);
-        }
-        log.error('error during HTTP request to check object metadata prior to repair',
-                  { bucket, key, statusCode: res.statusCode });
-        return cb(errors.InternalError);
-    });
+function repairObjectMD(bucketdUrl, repairMd, cb) {
+    return httpRequest('POST', bucketdUrl, repairMd, cb);
 }
 
-function checkDiffEntry(diffEntry, cb) {
-    if (!diffEntry[0]) {
-        const { bucket, key } = parseDiffKey(diffEntry[1].key);
-        const bucketdUrl = getBucketdURL(BUCKETD_HOSTPORT, {
-            Bucket: bucket,
-            Key: key,
-        });
-        const leaderMd = diffEntry[1].value;
-        const repairMd = leaderMd;
-        const parsedMd = JSON.parse(repairMd);
-        checkSproxydKeys(bucketdUrl, parsedMd.location, err => {
-            if (err) {
-                log.warn('object is not repairable: absent from follower\'s view '
-                         + 'and not readable from leader\'s view',
-                         { bucket, key });
-                return cb();
+function repairDiffEntry(diffEntry, cb) {
+    const { bucket, key } = parseDiffKey(diffEntry[0] ? diffEntry[0].key : diffEntry[1].key);
+    const bucketdUrl = getBucketdURL(BUCKETD_HOSTPORT, {
+        Bucket: bucket,
+        Key: key,
+    });
+    async.waterfall([
+        next => async.map(diffEntry, (diffItem, itemDone) => {
+            if (!diffItem) {
+                return itemDone(null, false);
             }
-            // if there was no error, the object is not corrupted so
-            // we can safely repair its metadata
-            return repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, err => {
-                if (err) {
-                    if (!err.PreconditionFailed) {
-                        log.error('an error occurred trying to repair object using '
-                                  + 'leader\'s view',
-                                  { bucket, key, error: err.message });
-                    }
-                } else {
-                    log.info('object absent from follower repaired using leader\'s view',
-                             { bucket, key });
-                }
-                cb();
-            });
-        });
-    } else if (!diffEntry[1]) {
-        const { bucket, key } = parseDiffKey(diffEntry[0].key);
-        const bucketdUrl = getBucketdURL(BUCKETD_HOSTPORT, {
-            Bucket: bucket,
-            Key: key,
-        });
-        const repairMd = diffEntry[0].value;
-        const parsedMd = JSON.parse(repairMd);
-        checkSproxydKeys(bucketdUrl, parsedMd.location, err => {
-            if (err) {
-                log.warn('object is not repairable: absent from leader\'s view '
-                         + 'and not readable from follower\'s view',
-                         { bucket, key });
-                return cb();
-            }
-            // if there was no error, the object is not corrupted so
-            // we can safely repair its metadata
-            // pass 'null' as the leader MD because it is expected not to exist
-            return repairObjectMD(bucket, key, bucketdUrl, null, repairMd, err => {
-                if (err) {
-                    if (!err.PreconditionFailed) {
-                        log.error('an error occurred trying to repair object using '
-                                  + 'follower\'s view',
-                                  { bucket, key, error: err.message });
-                    }
-                } else {
-                    log.info('object absent from leader repaired using follower\'s view',
-                             { bucket, key });
-                }
-                cb();
-            });
-        });
-    } else {
-        const { bucket, key } = parseDiffKey(diffEntry[0].key);
-        const bucketdUrl = getBucketdURL(BUCKETD_HOSTPORT, {
-            Bucket: bucket,
-            Key: key,
-        });
-        async.map(diffEntry, (diffItem, itemDone) => {
             const parsedMd = JSON.parse(diffItem.value);
             checkSproxydKeys(bucketdUrl, parsedMd.location, err => itemDone(null, err ? false : true));
-        }, (_, diffItemIsValid) => {
-            if (diffItemIsValid[0] && diffItemIsValid[1]) {
-                log.warn('object requires a manual check: is readable from both '
-                         + 'leader\'s view and follower\'s view but metadata is different',
-                         { bucket, key });
-                cb();
-            } else if (diffItemIsValid[0]) {
-                const [leaderMd, repairMd] = [diffEntry[1].value, diffEntry[0].value];
-                return repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, err => {
-                    if (err) {
-                        if (!err.PreconditionFailed) {
-                            log.error('an error occurred trying to repair object using '
-                                      + 'follower\'s view',
-                                      { bucket, key, error: err.message });
-                        }
-                    } else {
-                        log.info('object not readable on leader repaired using follower\'s view',
-                                 { bucket, key });
-                    }
-                    cb();
+        }, next),
+        ([
+            followerIsReadable,
+            leaderIsReadable,
+        ], next) => httpRequest('GET', bucketdUrl, null, (err, res) => {
+            if (err || (res.statusCode !== 200 && res.statusCode !== 404)) {
+                log.error('error during HTTP request to check object metadata prior to repair', {
+                    bucket,
+                    key,
+                    error: err && err.message,
+                    statusCode: res.statusCode,
                 });
-            } else if (diffItemIsValid[1]) {
-                const [leaderMd, repairMd] = [diffEntry[0].value, diffEntry[1].value];
-                return repairObjectMD(bucket, key, bucketdUrl, leaderMd, repairMd, err => {
-                    if (err) {
-                        if (!err.PreconditionFailed) {
-                            log.error('an error occurred trying to repair object from '
-                                      + 'leader\'s view',
-                                      { bucket, key, error: err.message });
-                        }
-                    } else {
-                        log.info('object not readable on follower repaired using leader\'s view',
-                                 { bucket, key });
-                    }
-                    cb();
-                });
-            } else {
-                log.warn('object is not repairable: not readable from neither '
-                         + 'leader\'s view nor follower\'s view',
-                         { bucket, key });
-                cb();
+                return next(err);
             }
-        });
-    }
+            const refreshedLeaderMd = (res.statusCode === 200 ? res.body : null);
+            const followerState = {
+                diffMd: diffEntry[0] && diffEntry[0].value,
+                isReadable: followerIsReadable,
+            };
+            const leaderState = {
+                diffMd: diffEntry[1] && diffEntry[1].value,
+                refreshedMd: refreshedLeaderMd,
+                isReadable: leaderIsReadable,
+            };
+            return next(null, followerState, leaderState);
+        }),
+        (followerState, leaderState, next) => {
+            const repairStrategy = getRepairStrategy(followerState, leaderState);
+            const logFunc = repairStrategy.status === 'NotRepairable' ? log.warn : log.info;
+            logFunc.bind(log)(repairStrategy.message, {
+                bucket,
+                key,
+                repairStatus: repairStrategy.status,
+            });
+            if (repairStrategy.status !== 'AutoRepair') {
+                return next();
+            }
+            const repairMd = repairStrategy.source === 'Follower'
+                  ? followerState.diffMd
+                  : leaderState.diffMd;
+            return repairObjectMD(bucketdUrl, repairMd, next);
+        },
+        (repairResult, next) => {
+            if (repairResult.statusCode !== 200) {
+                log.error('HTTP request to repair object returned an error status', {
+                    bucket,
+                    key,
+                    statusCode: repairResult.statusCode,
+                    statusMessage: repairResult.body,
+                });
+                return next(errors.InternalError);
+            }
+            return next();
+        }
+    ], () => cb());
 }
 
 function consumeStdin(cb) {
@@ -309,7 +227,7 @@ function consumeStdin(cb) {
     diffEntryStream
         .on('data', diffEntry => {
             diffEntryStream.pause();
-            return checkDiffEntry(diffEntry, () => {
+            return repairDiffEntry(diffEntry, () => {
                 diffEntryStream.resume();
             });
         })
