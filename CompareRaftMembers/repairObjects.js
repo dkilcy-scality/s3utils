@@ -45,6 +45,14 @@ if (!SPROXYD_HOSTPORT) {
 
 const log = new Logger('s3utils:CompareRaftMembers:repairObjects');
 
+const countByStatus = {
+    AutoRepair: 0,
+    AutoRepairError: 0,
+    ManualRepair: 0,
+    NotRepairable: 0,
+    UpdatedByClient: 0,
+};
+
 const httpAgent = new http.Agent({
     keepAlive: true,
 });
@@ -199,13 +207,20 @@ function repairDiffEntry(diffEntry, cb) {
                 key,
                 repairStatus: repairStrategy.status,
             });
+            countByStatus[repairStrategy.status] += 1;
             if (repairStrategy.status !== 'AutoRepair') {
                 return next();
             }
             const repairMd = repairStrategy.source === 'Follower'
                   ? followerState.diffMd
                   : leaderState.diffMd;
-            return repairObjectMD(bucketdUrl, repairMd, next);
+            return repairObjectMD(bucketdUrl, repairMd, err => {
+                if (err) {
+                    countByStatus.AutoRepairError += 1;
+                    return next(err);
+                }
+                return next();
+            });
         },
         (repairResult, next) => {
             if (repairResult.statusCode !== 200) {
@@ -215,6 +230,7 @@ function repairDiffEntry(diffEntry, cb) {
                     statusCode: repairResult.statusCode,
                     statusMessage: repairResult.body,
                 });
+                countByStatus.AutoRepairError += 1;
                 return next(errors.InternalError);
             }
             return next();
@@ -253,7 +269,7 @@ function main() {
             });
             process.exit(1);
         } else {
-            log.info('completed repair');
+            log.info('completed repair', { countByStatus });
             process.exit(0);
         }
     });
