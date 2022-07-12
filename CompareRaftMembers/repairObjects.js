@@ -1,12 +1,16 @@
+/* eslint-disable no-console */
+
 const async = require('async');
 const http = require('http');
 const jsonStream = require('JSONStream');
 
 const { Logger } = require('werelogs');
-const { jsutil, errors } = require('arsenal');
+const { jsutil, errors, versioning } = require('arsenal');
 
 const getBucketdURL = require('../VerifyBucketSproxydKeys/getBucketdURL');
 const getRepairStrategy = require('./RepairObjects/getRepairStrategy');
+
+const VID_SEP = versioning.VersioningConstants.VersionId.Separator;
 
 const {
     BUCKETD_HOSTPORT, SPROXYD_HOSTPORT,
@@ -59,6 +63,18 @@ const httpAgent = new http.Agent({
 
 let sproxydAlias;
 
+const retryDelayMs = 1000;
+const maxRetryDelayMs = 10000;
+
+const retryParams = {
+    times: 20,
+    interval: retryCount => Math.min(
+        // the first retry comes as "retryCount=2", hence substract 2
+        retryDelayMs * (2 ** (retryCount - 2)),
+        maxRetryDelayMs,
+    ),
+};
+
 function httpRequest(method, url, requestBody, cb) {
     const cbOnce = jsutil.once(cb);
     const urlObj = new URL(url);
@@ -81,13 +97,12 @@ function httpRequest(method, url, requestBody, cb) {
             return cbOnce(null, res);
         });
         res.once('error', err => cbOnce(new Error(
-            'error reading response from HTTP request '
-                + `to ${url}: ${err.message}`
+            `error reading response from HTTP request to ${url}: ${err.message}`,
         )));
         return undefined;
     });
     req.once('error', err => cbOnce(new Error(
-        `error sending HTTP request to ${url}: ${err.message}`
+        `error sending HTTP request to ${url}: ${err.message}`,
     )));
     req.end(requestBody || undefined);
 }
@@ -100,7 +115,7 @@ function getSproxydAlias(cb) {
         }
         if (res.statusCode !== 200) {
             return cb(new Error(
-                `GET ${url} returned status ${res.statusCode}`
+                `GET ${url} returned status ${res.statusCode}`,
             ));
         }
         const resp = JSON.parse(res.body);
@@ -116,27 +131,29 @@ function checkSproxydKeys(bucketdUrl, locations, cb) {
     return async.eachSeries(locations, (loc, locDone) => {
         // existence check
         const sproxydUrl = `http://${SPROXYD_HOSTPORT}/${sproxydAlias}/${loc.key}`;
-        httpRequest('HEAD', sproxydUrl, null, (err, res) => {
+        let locationNotFound = false;
+        async.retry(retryParams, reqDone => httpRequest('HEAD', sproxydUrl, null, (err, res) => {
             if (err) {
                 log.error('sproxyd check error', {
                     bucketdUrl,
                     sproxydKey: loc.key,
                     error: { message: err.message },
                 });
-                locDone(err);
+                reqDone(err);
             } else if (res.statusCode === 404) {
                 log.error('sproxyd check reported missing key', {
                     bucketdUrl,
                     sproxydKey: loc.key,
                 });
-                locDone(errors.LocationNotFound);
+                locationNotFound = true;
+                reqDone();
             } else if (res.statusCode !== 200) {
                 log.error('sproxyd check returned HTTP error', {
                     bucketdUrl,
                     sproxydKey: loc.key,
                     httpCode: res.statusCode,
                 });
-                locDone(err);
+                reqDone(err);
             } else {
                 if (VERBOSE) {
                     log.info('sproxyd check returned success', {
@@ -144,8 +161,16 @@ function checkSproxydKeys(bucketdUrl, locations, cb) {
                         sproxydKey: loc.key,
                     });
                 }
-                locDone();
+                reqDone();
             }
+        }), err => {
+            if (err) {
+                return locDone(err);
+            }
+            if (locationNotFound) {
+                return locDone(errors.LocationNotFound);
+            }
+            return locDone();
         });
     }, cb);
 }
@@ -153,7 +178,16 @@ function checkSproxydKeys(bucketdUrl, locations, cb) {
 function parseDiffKey(diffKey) {
     const slashPos = diffKey.indexOf('/');
     const [bucket, key] = [diffKey.slice(0, slashPos), diffKey.slice(slashPos + 1)];
-    return { bucket, key };
+
+    // fetching info from the master key in case we are repairing a
+    // version key: in such case if the associated master key is the
+    // same version or does not exist, we also need to repair it with
+    // the same metadata to keep the object consistency.
+    const vidSepPos = key.indexOf(VID_SEP);
+    const masterKeyInfo = vidSepPos !== -1 ? {
+        key: key.slice(0, vidSepPos),
+        versionId: key.slice(vidSepPos + 1),
+    } : null;
 }
 
 function repairObjectMD(bucketdUrl, repairMd, cb) {
@@ -161,45 +195,86 @@ function repairObjectMD(bucketdUrl, repairMd, cb) {
 }
 
 function repairDiffEntry(diffEntry, cb) {
-    const { bucket, key } = parseDiffKey(diffEntry[0] ? diffEntry[0].key : diffEntry[1].key);
+    const {
+        bucket,
+        key,
+        masterKeyInfo,
+    } = parseDiffKey(diffEntry[0] ? diffEntry[0].key : diffEntry[1].key);
     const bucketdUrl = getBucketdURL(BUCKETD_HOSTPORT, {
         Bucket: bucket,
         Key: key,
     });
+    const masterBucketdUrl = masterKeyInfo ? getBucketdURL(BUCKETD_HOSTPORT, {
+        Bucket: bucket,
+        Key: masterKeyInfo.key,
+    }) : null;
+
     async.waterfall([
         next => async.map(diffEntry, (diffItem, itemDone) => {
             if (!diffItem) {
                 return itemDone(null, false);
             }
             const parsedMd = JSON.parse(diffItem.value);
-            checkSproxydKeys(bucketdUrl, parsedMd.location, err => itemDone(null, err ? false : true));
+            return checkSproxydKeys(
+                bucketdUrl,
+                parsedMd.location,
+                err => itemDone(null, !err),
+            );
         }, next),
         ([
             followerIsReadable,
             leaderIsReadable,
-        ], next) => httpRequest('GET', bucketdUrl, null, (err, res) => {
-            if (err || (res.statusCode !== 200 && res.statusCode !== 404)) {
-                log.error('error during HTTP request to check object metadata prior to repair', {
-                    bucket,
-                    key,
-                    error: err && err.message,
-                    statusCode: res.statusCode,
-                });
-                return next(err);
-            }
-            const refreshedLeaderMd = (res.statusCode === 200 ? res.body : null);
-            const followerState = {
-                diffMd: diffEntry[0] && diffEntry[0].value,
-                isReadable: followerIsReadable,
-            };
-            const leaderState = {
-                diffMd: diffEntry[1] && diffEntry[1].value,
-                refreshedMd: refreshedLeaderMd,
-                isReadable: leaderIsReadable,
-            };
-            return next(null, followerState, leaderState);
-        }),
-        (followerState, leaderState, next) => {
+        ], next) => async.map(
+            [bucketdUrl, masterBucketdUrl],
+            (url, urlDone) => {
+                if (!url) {
+                    return urlDone();
+                }
+                return async.retry(
+                    retryParams,
+                    reqDone => httpRequest('GET', url, null, (err, res) => {
+                        if (err || (res.statusCode !== 200 && res.statusCode !== 404)) {
+                            log.error('error during HTTP request to check object metadata prior to repair', {
+                                bucket,
+                                key,
+                                url,
+                                error: err && err.message,
+                                statusCode: res.statusCode,
+                            });
+                            return reqDone(err);
+                        }
+                        return reqDone(null, res);
+                    }),
+                    urlDone,
+                );
+            },
+            (err, [keyRes, masterKeyRes]) => {
+                if (err) {
+                    return next(err);
+                }
+                let repairMaster = false;
+                if (masterKeyRes) {
+                    if (masterKeyRes.statusCode === 404) {
+                        repairMaster = true;
+                    } else {
+                        const parsedMasterKeyMd = JSON.parse(masterKeyRes.body);
+                        repairMaster = (parsedMasterKeyMd.versionId === masterKeyInfo.versionId);
+                    }
+                }
+                const refreshedLeaderMd = (keyRes.statusCode === 200 ? keyRes.body : null);
+                const followerState = {
+                    diffMd: diffEntry[0] && diffEntry[0].value,
+                    isReadable: followerIsReadable,
+                };
+                const leaderState = {
+                    diffMd: diffEntry[1] && diffEntry[1].value,
+                    refreshedMd: refreshedLeaderMd,
+                    isReadable: leaderIsReadable,
+                };
+                return next(null, followerState, leaderState, repairMaster);
+            },
+        ),
+        (followerState, leaderState, repairMaster, next) => {
             const repairStrategy = getRepairStrategy(followerState, leaderState);
             const logFunc = repairStrategy.status === 'NotRepairable' ? log.warn : log.info;
             logFunc.bind(log)(repairStrategy.message, {
@@ -212,29 +287,40 @@ function repairDiffEntry(diffEntry, cb) {
                 return next();
             }
             const repairMd = repairStrategy.source === 'Follower'
-                  ? followerState.diffMd
-                  : leaderState.diffMd;
-            return repairObjectMD(bucketdUrl, repairMd, err => {
-                if (err) {
-                    countByStatus.AutoRepairError += 1;
-                    return next(err);
-                }
-                return next();
-            });
+                ? followerState.diffMd
+                : leaderState.diffMd;
+            return async.each(
+                [bucketdUrl, repairMaster ? masterBucketdUrl : null],
+                (url, urlDone) => {
+                    if (!url) {
+                        return urlDone();
+                    }
+                    return repairObjectMD(url, repairMd, (err, repairResult) => {
+                        if (err) {
+                            return urlDone(err);
+                        }
+                        if (repairResult.statusCode !== 200) {
+                            log.error('HTTP request to repair object returned an error status', {
+                                bucket,
+                                key,
+                                url,
+                                statusCode: repairResult.statusCode,
+                                statusMessage: repairResult.body,
+                            });
+                            return urlDone(errors.InternalError);
+                        }
+                        return urlDone();
+                    });
+                },
+                err => {
+                    if (err) {
+                        countByStatus.AutoRepairError += 1;
+                        return next(err);
+                    }
+                    return next();
+                },
+            );
         },
-        (repairResult, next) => {
-            if (repairResult.statusCode !== 200) {
-                log.error('HTTP request to repair object returned an error status', {
-                    bucket,
-                    key,
-                    statusCode: repairResult.statusCode,
-                    statusMessage: repairResult.body,
-                });
-                countByStatus.AutoRepairError += 1;
-                return next(errors.InternalError);
-            }
-            return next();
-        }
     ], () => cb());
 }
 
@@ -266,6 +352,7 @@ function main() {
         if (err) {
             log.error('an error occurred during repair', {
                 error: { message: err.message },
+                countByStatus,
             });
             process.exit(1);
         } else {

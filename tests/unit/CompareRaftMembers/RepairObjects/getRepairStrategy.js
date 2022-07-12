@@ -242,7 +242,7 @@ describe('RepairObjects.getRepairStrategy()', () => {
         },
     ].forEach(testCase => {
         const sourceDesc = testCase.expectedRepairSource
-              ? ` from ${testCase.expectedRepairSource} source` : '';
+            ? ` from ${testCase.expectedRepairSource} source` : '';
         const testDesc = `object ${testCase.desc} should give status `
         + `${testCase.expectedRepairStatus}${sourceDesc}`;
         test(testDesc, () => {
