@@ -1,4 +1,8 @@
-function getRepairStrategy(followerState, leaderState) {
+const { versioning } = require('arsenal');
+
+const VID_SEP = versioning.VersioningConstants.VersionId.Separator;
+
+function getRepairStrategy(followerState, leaderState, olderThan) {
     if (leaderState.refreshedMd) {
         if (!leaderState.diffMd) {
             return {
@@ -19,6 +23,22 @@ function getRepairStrategy(followerState, leaderState) {
                 message: 'changed on leader\'s view (missing but expected to exist)',
             };
         }
+    }
+    const isTooRecent = diffMd => {
+        const parsedDiffMd = JSON.parse(diffMd);
+        if (parsedDiffMd['last-modified']) {
+            const lastModified = new Date(parsedDiffMd['last-modified']);
+            return lastModified >= olderThan;
+        }
+        return false;
+    };
+    const leaderTooRecent = leaderState.isReadable && isTooRecent(leaderState.diffMd);
+    const followerTooRecent = followerState.isReadable && isTooRecent(followerState.diffMd);
+    if (leaderTooRecent || followerTooRecent) {
+        return {
+            status: 'TooRecent',
+            message: 'last-modified too recent, not repairing',
+        };
     }
     if (!followerState.diffMd && !leaderState.isReadable) {
         return {

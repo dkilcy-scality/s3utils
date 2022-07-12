@@ -18,6 +18,12 @@ const {
 
 const VERBOSE = process.env.VERBOSE === '1';
 
+const ONE_WEEK_AGO = new Date();
+ONE_WEEK_AGO.setDate(ONE_WEEK_AGO.getDate() - 7);
+const OLDER_THAN = process.env.OLDER_THAN
+    ? new Date(process.env.OLDER_THAN)
+    : ONE_WEEK_AGO;
+
 const USAGE = `
 CompareRaftMembers/repairObjects.js
 
@@ -33,7 +39,12 @@ Mandatory environment variables:
     SPROXYD_HOSTPORT: ip:port of sproxyd endpoint
 
 Optional environment variables:
-    VERBOSE: set to 1 for more verbose output (shows one line for every sproxyd key checked)
+    OLDER_THAN: only repair objects which "last-modified" field is
+    older than this date, e.g. setting to "2021-01-09T00:00:00Z"
+    limits the repair to objects created or modified before
+    Jan 9th 2021. Default is one week ago.
+    VERBOSE: set to 1 for more verbose output (shows one line for
+    every sproxyd key checked)
 `;
 
 if (!BUCKETD_HOSTPORT) {
@@ -46,6 +57,11 @@ if (!SPROXYD_HOSTPORT) {
     console.error(USAGE);
     process.exit(1);
 }
+if (OLDER_THAN && Number.isNaN(OLDER_THAN.getTime())) {
+    console.error('OLDER_THAN is an invalid date');
+    console.error(USAGE);
+    process.exit(1);
+}
 
 const log = new Logger('s3utils:CompareRaftMembers:repairObjects');
 
@@ -55,6 +71,7 @@ const countByStatus = {
     ManualRepair: 0,
     NotRepairable: 0,
     UpdatedByClient: 0,
+    TooRecent: 0,
 };
 
 const httpAgent = new http.Agent({
@@ -178,16 +195,7 @@ function checkSproxydKeys(bucketdUrl, locations, cb) {
 function parseDiffKey(diffKey) {
     const slashPos = diffKey.indexOf('/');
     const [bucket, key] = [diffKey.slice(0, slashPos), diffKey.slice(slashPos + 1)];
-
-    // fetching info from the master key in case we are repairing a
-    // version key: in such case if the associated master key is the
-    // same version or does not exist, we also need to repair it with
-    // the same metadata to keep the object consistency.
-    const vidSepPos = key.indexOf(VID_SEP);
-    const masterKeyInfo = vidSepPos !== -1 ? {
-        key: key.slice(0, vidSepPos),
-        versionId: key.slice(vidSepPos + 1),
-    } : null;
+    return { bucket, key };
 }
 
 function repairObjectMD(bucketdUrl, repairMd, cb) {
@@ -198,16 +206,15 @@ function repairDiffEntry(diffEntry, cb) {
     const {
         bucket,
         key,
-        masterKeyInfo,
     } = parseDiffKey(diffEntry[0] ? diffEntry[0].key : diffEntry[1].key);
+    const isMasterKey = !key.includes(VID_SEP);
+
     const bucketdUrl = getBucketdURL(BUCKETD_HOSTPORT, {
         Bucket: bucket,
         Key: key,
     });
-    const masterBucketdUrl = masterKeyInfo ? getBucketdURL(BUCKETD_HOSTPORT, {
-        Bucket: bucket,
-        Key: masterKeyInfo.key,
-    }) : null;
+    // will be set only for master keys associated to a version key, to repair the version key
+    let versionBucketdUrl = null;
 
     async.waterfall([
         next => async.map(diffEntry, (diffItem, itemDone) => {
@@ -215,6 +222,12 @@ function repairDiffEntry(diffEntry, cb) {
                 return itemDone(null, false);
             }
             const parsedMd = JSON.parse(diffItem.value);
+            if (isMasterKey && parsedMd.versionId) {
+                versionBucketdUrl = getBucketdURL(BUCKETD_HOSTPORT, {
+                    Bucket: bucket,
+                    Key: `${key}${VID_SEP}${parsedMd.versionId}`,
+                });
+            }
             return checkSproxydKeys(
                 bucketdUrl,
                 parsedMd.location,
@@ -224,44 +237,25 @@ function repairDiffEntry(diffEntry, cb) {
         ([
             followerIsReadable,
             leaderIsReadable,
-        ], next) => async.map(
-            [bucketdUrl, masterBucketdUrl],
-            (url, urlDone) => {
-                if (!url) {
-                    return urlDone();
+        ], next) => async.retry(
+            retryParams,
+            reqDone => httpRequest('GET', bucketdUrl, null, (err, res) => {
+                if (err || (res.statusCode !== 200 && res.statusCode !== 404)) {
+                    log.error('error during HTTP request to check object metadata prior to repair', {
+                        bucket,
+                        key,
+                        error: err && err.message,
+                        statusCode: res.statusCode,
+                    });
+                    return reqDone(err);
                 }
-                return async.retry(
-                    retryParams,
-                    reqDone => httpRequest('GET', url, null, (err, res) => {
-                        if (err || (res.statusCode !== 200 && res.statusCode !== 404)) {
-                            log.error('error during HTTP request to check object metadata prior to repair', {
-                                bucket,
-                                key,
-                                url,
-                                error: err && err.message,
-                                statusCode: res.statusCode,
-                            });
-                            return reqDone(err);
-                        }
-                        return reqDone(null, res);
-                    }),
-                    urlDone,
-                );
-            },
-            (err, [keyRes, masterKeyRes]) => {
+                return reqDone(null, res);
+            }),
+            (err, res) => {
                 if (err) {
                     return next(err);
                 }
-                let repairMaster = false;
-                if (masterKeyRes) {
-                    if (masterKeyRes.statusCode === 404) {
-                        repairMaster = true;
-                    } else {
-                        const parsedMasterKeyMd = JSON.parse(masterKeyRes.body);
-                        repairMaster = (parsedMasterKeyMd.versionId === masterKeyInfo.versionId);
-                    }
-                }
-                const refreshedLeaderMd = (keyRes.statusCode === 200 ? keyRes.body : null);
+                const refreshedLeaderMd = (res.statusCode === 200 ? res.body : null);
                 const followerState = {
                     diffMd: diffEntry[0] && diffEntry[0].value,
                     isReadable: followerIsReadable,
@@ -271,17 +265,19 @@ function repairDiffEntry(diffEntry, cb) {
                     refreshedMd: refreshedLeaderMd,
                     isReadable: leaderIsReadable,
                 };
-                return next(null, followerState, leaderState, repairMaster);
+                return next(null, followerState, leaderState);
             },
         ),
-        (followerState, leaderState, repairMaster, next) => {
-            const repairStrategy = getRepairStrategy(followerState, leaderState);
-            const logFunc = repairStrategy.status === 'NotRepairable' ? log.warn : log.info;
-            logFunc.bind(log)(repairStrategy.message, {
-                bucket,
-                key,
-                repairStatus: repairStrategy.status,
-            });
+        (followerState, leaderState, next) => {
+            const repairStrategy = getRepairStrategy(followerState, leaderState, OLDER_THAN);
+            if (repairStrategy.message) {
+                const logFunc = repairStrategy.status === 'NotRepairable' ? log.warn : log.info;
+                logFunc.bind(log)(repairStrategy.message, {
+                    bucket,
+                    key,
+                    repairStatus: repairStrategy.status,
+                });
+            }
             countByStatus[repairStrategy.status] += 1;
             if (repairStrategy.status !== 'AutoRepair') {
                 return next();
@@ -289,37 +285,29 @@ function repairDiffEntry(diffEntry, cb) {
             const repairMd = repairStrategy.source === 'Follower'
                 ? followerState.diffMd
                 : leaderState.diffMd;
-            return async.each(
-                [bucketdUrl, repairMaster ? masterBucketdUrl : null],
-                (url, urlDone) => {
-                    if (!url) {
-                        return urlDone();
-                    }
-                    return repairObjectMD(url, repairMd, (err, repairResult) => {
-                        if (err) {
-                            return urlDone(err);
-                        }
-                        if (repairResult.statusCode !== 200) {
-                            log.error('HTTP request to repair object returned an error status', {
-                                bucket,
-                                key,
-                                url,
-                                statusCode: repairResult.statusCode,
-                                statusMessage: repairResult.body,
-                            });
-                            return urlDone(errors.InternalError);
-                        }
-                        return urlDone();
+            return repairObjectMD(bucketdUrl, repairMd, (err, repairResult) => {
+                if (err) {
+                    countByStatus.AutoRepairError += 1;
+                    return next(err);
+                }
+                if (repairResult.statusCode !== 200) {
+                    log.error('HTTP request to repair object returned an error status', {
+                        bucket,
+                        key,
+                        statusCode: repairResult.statusCode,
+                        statusMessage: repairResult.body,
                     });
-                },
-                err => {
-                    if (err) {
-                        countByStatus.AutoRepairError += 1;
-                        return next(err);
-                    }
-                    return next();
-                },
-            );
+                    countByStatus.AutoRepairError += 1;
+                    return next(errors.InternalError);
+                }
+                log.info('repaired object metadata successfully', {
+                    bucket,
+                    key,
+                    repairStatus: 'AutoRepair',
+                    repairSource: repairStrategy.source,
+                });
+                return next();
+            });
         },
     ], () => cb());
 }

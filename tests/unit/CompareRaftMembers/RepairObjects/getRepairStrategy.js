@@ -240,13 +240,45 @@ describe('RepairObjects.getRepairStrategy()', () => {
             },
             expectedRepairStatus: 'UpdatedByClient',
         },
+        {
+            desc: 'readable on both leader and follower but follower too recent',
+            followerState: {
+                diffMd: '{"foo":"bar","last-modified":"2022-07-13T00:00:00.000Z"}',
+                isReadable: true,
+            },
+            leaderState: {
+                diffMd: '{"foo":"bar","last-modified":"2022-07-11T00:00:00.000Z"}',
+                isReadable: true,
+                refreshedMd: '{"foo":"bar","last-modified":"2022-07-11T00:00:00.000Z"}',
+            },
+            olderThan: new Date('2022-07-12T00:00:00.000Z'),
+            expectedRepairStatus: 'TooRecent',
+        },
+        {
+            desc: 'readable on both leader and follower but leader too recent',
+            followerState: {
+                diffMd: '{"foo":"bar","last-modified":"2022-07-11T00:00:00.000Z"}',
+                isReadable: true,
+            },
+            leaderState: {
+                diffMd: '{"foo":"bar","last-modified":"2022-07-13T00:00:00.000Z"}',
+                isReadable: true,
+                refreshedMd: '{"foo":"bar","last-modified":"2022-07-13T00:00:00.000Z"}',
+            },
+            olderThan: new Date('2022-07-12T00:00:00.000Z'),
+            expectedRepairStatus: 'TooRecent',
+        },
     ].forEach(testCase => {
         const sourceDesc = testCase.expectedRepairSource
             ? ` from ${testCase.expectedRepairSource} source` : '';
         const testDesc = `object ${testCase.desc} should give status `
         + `${testCase.expectedRepairStatus}${sourceDesc}`;
         test(testDesc, () => {
-            const repairStrategy = getRepairStrategy(testCase.followerState, testCase.leaderState);
+            const repairStrategy = getRepairStrategy(
+                testCase.followerState,
+                testCase.leaderState,
+                testCase.olderThan,
+            );
             expect(repairStrategy.status).toEqual(testCase.expectedRepairStatus);
             expect(repairStrategy.source).toEqual(testCase.expectedRepairSource);
         });
